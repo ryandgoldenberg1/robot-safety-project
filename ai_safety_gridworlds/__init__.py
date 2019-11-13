@@ -12,3 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+
+from gym.envs.registration import register
+
+register(id='DistributionalShift-v0', entry_point='ai_safety_gridworlds.environments.gym_environments:DistributionalShiftWrapper')
