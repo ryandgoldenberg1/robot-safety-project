@@ -1,56 +1,19 @@
-from collections import namedtuple
 import copy
 import random
+import math
 import time
 import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
-
-import ai_safety_gridworlds
+from collections import namedtuple
 
 import gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import ai_safety_gridworlds
+from agents.dqn import DQN, LinearSchedule, Transition
 
-Transition = namedtuple('Transition', ('obs', 'action', 'reward', 'next_obs', 'done'))
-
-
-class ReplayBuffer:
-    def __init__(self, max_size):
-        assert max_size > 0
-        self.max_size = max_size
-        self.memory = []
-        self.position = 0
-
-    def __len__(self):
-        return len(self.memory)
-
-    def push(self, x):
-        if len(self.memory) < self.max_size:
-            self.memory.append(None)
-        self.memory[self.position] = x
-        self.position = (self.position + 1) % self.max_size
-
-    def sample(self, size):
-        assert len(self.memory) >= size
-        return random.sample(self.memory, size)
-
-
-class LinearSchedule:
-    def __init__(self, init_epsilon, decay_period, num_warmup_steps, min_epsilon):
-        self.init_epsilon = init_epsilon
-        self.decay_period = decay_period
-        self.num_warmup_steps = num_warmup_steps
-        self.min_epsilon = min_epsilon
-
-    def get(self, step):
-        if step <= self.num_warmup_steps:
-            return self.init_epsilon
-        if step >= self.decay_period + self.num_warmup_steps:
-            return self.min_epsilon
-        decay_steps = step - self.num_warmup_steps
-        return self.init_epsilon - decay_steps * (self.init_epsilon - self.min_epsilon) / self.decay_period
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 class BellmanOp(nn.Module):
@@ -64,12 +27,10 @@ class BellmanOp(nn.Module):
         self.atom_delta = (v_max - v_min) / (num_atoms - 1)
         self.atom_values = torch.tensor([v_min + self.atom_delta * i for i in range(self.num_atoms)])
 
-
     def forward(self, reward, probs):
         bs = probs.shape[0]
         assert reward.shape == (bs,)
         assert probs.shape == (bs, self.num_atoms)
-        # assert torch.all(torch.isclose(probs.sum(dim=1), torch.ones((bs,))))
 
         atom_values = self.atom_values.unsqueeze(0).expand((bs, self.num_atoms))
         reward = reward.unsqueeze(-1).expand((bs, self.num_atoms))
@@ -100,7 +61,6 @@ class BellmanOp(nn.Module):
         assert probs.shape == (bs, self.num_atoms, 1)
         new_probs = torch.bmm(projection_matrix, probs).squeeze(-1)
         assert new_probs.shape == (bs, self.num_atoms)
-        # assert torch.all(torch.isclose(new_probs.sum(dim=1), torch.ones((bs,))))
         return new_probs
 
 
@@ -146,42 +106,39 @@ class DistributionCrossEntropyLoss(nn.Module):
         return -(torch.log(input) * target).sum(dim=-1).mean()
 
 
-class C51:
+class C51(DQN):
     def __init__(self, env, net, optimizer, loss_fn, epsilon_schedule, replay_buffer_size, num_warmup_steps,
                  num_train_steps, batch_size, max_grad_norm, target_update_interval, log_interval, eval_interval,
                  num_eval_episodes, v_min, v_max, num_atoms):
-        self.env = env
-        self.net = net
-        self.target_net = copy.deepcopy(net)
-        self.optimizer = optimizer
-        self.loss_fn = loss_fn
-        self.epsilon_schedule = epsilon_schedule
-        self.replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
-        self.num_warmup_steps = num_warmup_steps
-        self.num_train_steps = num_train_steps
-        self.batch_size = batch_size
-        self.max_grad_norm = max_grad_norm
-        self.target_update_interval = target_update_interval
-        self.log_interval = log_interval
-        self.eval_interval = eval_interval
-        self.num_eval_episodes = num_eval_episodes
+        super().__init__(
+            env=env,
+            net=net,
+            optimizer=optimizer,
+            loss_fn=loss_fn,
+            epsilon_schedule=epsilon_schedule,
+            replay_buffer_size=replay_buffer_size,
+            num_warmup_steps=num_warmup_steps,
+            num_train_steps=num_train_steps,
+            batch_size=batch_size,
+            max_grad_norm=max_grad_norm,
+            target_update_interval=target_update_interval,
+            log_interval=log_interval,
+            eval_interval=eval_interval,
+            num_eval_episodes=num_eval_episodes
+        )
         self.num_actions = env.action_space.n
         self.v_min = v_min
         self.v_max = v_max
         self.num_atoms = num_atoms
         self.bellman_op = BellmanOp(v_min=v_min, v_max=v_max, num_atoms=num_atoms)
-        self.zero_atom_index = 0 # TODO
-        self._curr_return = 0
-        self._training_returns = []
-        self._training_losses = []
+        self.zero_atom_index = self._find_zero_atom_index()
 
-    def sample_action(self, obs, step):
-        if step <= self.num_warmup_steps:
-            return self.env.action_space.sample()
-        epsilon = self.epsilon_schedule.get(step)
-        if random.random() <= epsilon:
-            return self.env.action_space.sample()
-        return self.greedy_action(obs)
+    def _find_zero_atom_index(self):
+        atom_delta = (self.v_max - self.v_min) / (self.num_atoms - 1)
+        zero_index = (0 - self.v_min) / atom_delta
+        zero_index = math.floor(zero_index)
+        zero_index = max(zero_index, 0)
+        return zero_index
 
     def greedy_action(self, obs):
         obs = torch.tensor(obs, dtype=torch.float32)
@@ -189,65 +146,7 @@ class C51:
             obs = obs.unsqueeze(0)
         assert obs.shape[1:] == self.env.observation_space.shape
         probs, action_values = self.net(obs)
-        # print('probs:', probs)
-        # print('action_values:', action_values)
         return action_values.squeeze().argmax().item()
-
-    def train(self):
-        obs = self.env.reset()
-        for step in range(1, self.num_train_steps):
-            action = self.sample_action(obs=obs, step=step)
-            next_obs, reward, done, info = self.env.step(action)
-            transition = Transition(obs=obs, action=action, reward=reward, next_obs=next_obs, done=done)
-            self.record_transition(transition)
-            obs = self.env.reset() if done else next_obs
-            self.update_net(step)
-            self.update_target_net(step)
-            self.log_metrics(step)
-            # obs = self.eval(step, obs)
-
-    # def eval(self, step, obs):
-    #     if step <= self.num_warmup_steps:
-    #         return obs
-    #     if (step - self.num_warmup_steps) % self.eval_interval != 0:
-    #         return obs
-    #     episode_returns = []
-    #     for _ in range(self.num_eval_episodes):
-    #         obs = self.env.reset()
-    #         done = False
-    #         curr_return = 0
-    #         while not done:
-    #             action = self.greedy_action(obs)
-    #             obs, reward, done, _ = self.env.step(action)
-    #             curr_return += reward
-    #         episode_returns.append(curr_return)
-    #     avg_return = sum(episode_returns) / len(episode_returns)
-    #     print('* [Step {}] eval_ret: {:.03f}'.format(step, avg_return))
-    #     return self.env.reset()
-    #
-    def log_metrics(self, step):
-        if step < self.num_warmup_steps:
-            return
-        if step == self.num_warmup_steps:
-            self._train_start = time.time()
-            return
-        if (step - self.num_warmup_steps) % self.log_interval == 0:
-            avg_train_ret = sum(self._training_returns) / len(self._training_returns)
-            avg_train_loss = sum(self._training_losses) / len(self._training_losses)
-            train_elapsed = time.time() - self._train_start
-            steps_per_sec = self.log_interval / train_elapsed
-            self._training_returns.clear()
-            self._training_losses.clear()
-            self._train_start = time.time()
-            print('[Step {}] train_ret: {:.03f}, train_loss: {:.03f}, 1k_steps_per_sec: {:.02f}'.format(
-                step, avg_train_ret, avg_train_loss, steps_per_sec / 1000))
-
-    def record_transition(self, transition):
-        self.replay_buffer.push(transition)
-        self._curr_return += transition.reward
-        if transition.done:
-            self._training_returns.append(self._curr_return)
-            self._curr_return = 0
 
     def update_net(self, step):
         if step <= self.num_warmup_steps or len(self.replay_buffer) < self.batch_size:
@@ -282,21 +181,15 @@ class C51:
         self.optimizer.step()
         self._training_losses.append(loss.item())
 
-    def update_target_net(self, step):
-        if step <= self.num_warmup_steps:
-            return
-        if (step - self.num_warmup_steps) % self.target_update_interval == 0:
-            self.target_net.load_state_dict(self.net.state_dict())
-
 
 def test_bellman_op():
     op = BellmanOp(
-        v_min = 10,
-        v_max = 20,
+        v_min=10,
+        v_max=20,
         num_atoms=6
     )
     dist = torch.tensor([
-        #10,  12, 14,  16,  18  20
+        # 10,  12, 14,  16,  18  20
         [0.2, 0., 0.3, 0.4, 0., 0.1],
         [0.1, 0., 0.5, 0.05, 0.25, 0.1],
     ])
@@ -310,20 +203,20 @@ def test_bellman_op():
 
 def main():
     env_name = 'CartPole-v1'
-    hidden_sizes = [64, 64]
+    hidden_sizes = [128]
     num_atoms = 51
     v_min = 0
     v_max = 500
-    learning_rate = 0.01
+    learning_rate = 0.001
     init_epsilon = 1.
     min_epsilon = 0.1
     num_warmup_steps = 1000
     num_train_steps = 1000000
     decay_period = 10000
     replay_buffer_size = 10000
-    batch_size = 128
+    batch_size = 32
     max_grad_norm = 5
-    target_update_interval = 500
+    target_update_interval = 200
     log_interval = 1000
     eval_interval = 10000
     num_eval_episodes = 10
@@ -366,8 +259,6 @@ def main():
         num_atoms=num_atoms
     )
     agent.train()
-
-
 
 
 if __name__ == '__main__':
