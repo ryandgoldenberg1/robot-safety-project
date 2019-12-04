@@ -1,6 +1,8 @@
 import argparse
 import copy
 import json
+import os
+import warnings
 
 import gym
 import torch
@@ -158,7 +160,10 @@ class CategoricalTD0:
 
 class PPO:
     def __init__(self, env, actor, critic, actor_optimizer, clip_epsilon, entropy_coef, kl_coef, target_kl,
-                 num_train_iters, steps_per_iter, num_actor_epochs, num_critic_epochs, batch_size):
+                 num_train_iters, steps_per_iter, num_actor_epochs, num_critic_epochs, batch_size,
+                 save_interval, run_dir):
+        if save_interval is not None:
+            assert run_dir is not None
         self.env = env
         self.actor = actor
         self.critic = critic
@@ -172,10 +177,16 @@ class PPO:
         self.num_actor_epochs = num_actor_epochs
         self.num_critic_epochs = num_critic_epochs
         self.batch_size = batch_size
+        self.save_interval = save_interval
+        self.run_dir = run_dir
 
         self._obs = self.env.reset()
         self._obs_shape = self._obs.shape
         self._curr_return = 0.
+        self._metrics = []
+        if self.run_dir is not None:
+            self.models_dir = os.path.join(self.run_dir, 'models')
+            os.makedirs(self.models_dir, exist_ok=True)
 
     def train(self):
         for train_iter in range(1, self.num_train_iters + 1):
@@ -187,9 +198,10 @@ class PPO:
     def gather_experience(self):
         transitions = []
         returns = []
+        unsafe_actions = 0
         for _ in range(self.steps_per_iter):
             action = self.actor.sample_action(self._obs)
-            next_obs, reward, done, _ = self.env.step(action)
+            next_obs, reward, done, info = self.env.step(action)
             transition = utils.Transition(obs=self._obs, action=action, reward=reward, next_obs=next_obs, done=done)
             transitions.append(transition)
             self._obs = self.env.reset() if done else next_obs
@@ -197,8 +209,10 @@ class PPO:
             if done:
                 returns.append(self._curr_return)
                 self._curr_return = 0
+            if info is not None and info.get('unsafe') is True:
+                unsafe_actions += 1
         avg_return = sum(returns) / len(returns)
-        metrics = {'return': avg_return}
+        metrics = {'return': avg_return, 'unsafe_actions': unsafe_actions}
         return transitions, metrics
 
     def _create_dataset(self, transitions):
@@ -275,6 +289,28 @@ class PPO:
         metrics_str = ' | '.join(metrics_strs)
         step = train_iter * self.steps_per_iter
         print(f"[Iter {train_iter} Step {step/1000}k] {metrics_str}")
+        metrics = {'train_iter': train_iter, 'step': step, **metrics}
+        self._metrics.append(metrics)
+        # Save model at regular interval
+        if self.save_interval is not None and train_iter % self.save_interval == 0:
+            save_path = os.path.join(self.models_dir, f'step-{step}.pt')
+            with open(save_path, 'wb') as f:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    torch.save(self, f)
+            print(f'  Wrote checkpoint to: {save_path}')
+        # Save final model and run metrics at the end
+        if train_iter == self.num_train_iters:
+            model_path = os.path.join(self.run_dir, f'final-model-{step}.pt')
+            with open(model_path, 'wb') as f:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    torch.save(self, f)
+            print(f'  Wrote final model to: {model_path}')
+            metrics_path = os.path.join(self.run_dir, 'metrics.json')
+            with open(metrics_path, 'w') as f:
+                json.dump(self._metrics, f)
+            print(f'  Wrote run metrics to: {metrics_path}')
 
 
 def main():
@@ -294,6 +330,8 @@ def main():
     parser.add_argument('--num_actor_epochs', type=int, default=20)
     parser.add_argument('--num_critic_epochs', type=int, default=40)
     parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--save_interval', type=int)
+    parser.add_argument('--run_dir')
     # Categorical Arguments
     parser.add_argument('--use_categorical', default=False, action='store_true')
     parser.add_argument('--num_atoms', type=int, default=51)
@@ -305,6 +343,12 @@ def main():
     parser.add_argument('--channel_sizes', type=int, nargs='+', default=[16, 32, 32])
     args = parser.parse_args()
     print(json.dumps(args.__dict__, indent=2))
+
+    if args.run_dir is not None:
+        os.makedirs(args.run_dir, exist_ok=True)
+        args_path = os.path.join(args.run_dir, 'args.json')
+        with open(args_path, 'w') as f:
+            json.dump(args.__dict__, f)
 
     env = gym.make(args.env_name)
     obs_shape = env.observation_space.shape
@@ -351,7 +395,9 @@ def main():
         steps_per_iter=args.steps_per_iter,
         num_actor_epochs=args.num_actor_epochs,
         num_critic_epochs=args.num_critic_epochs,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        save_interval=args.save_interval,
+        run_dir=args.run_dir
     )
     ppo.train()
 

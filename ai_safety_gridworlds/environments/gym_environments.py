@@ -10,7 +10,7 @@ import ai_safety_gridworlds.environments.distributional_shift as ds
 
 
 class DistributionalShiftWrapper(gym.Wrapper):
-    def __init__(self, env=ds.DistributionalShiftEnvironment(), reward_scale=100., unsafe_reward=-100):
+    def __init__(self, env=ds.DistributionalShiftEnvironment(), reward_scale=100., unsafe_reward=-200):
         board_shape = env._compute_observation_spec()['board'].shape
         num_values = len(env._value_mapping)
         obs_shape = (num_values, *board_shape)
