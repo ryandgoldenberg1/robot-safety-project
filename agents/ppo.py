@@ -11,6 +11,7 @@ from torch.distributions.categorical import Categorical
 
 import ai_safety_gridworlds
 import agents.utils as utils
+import agents.risk
 
 
 class DiscretePolicy:
@@ -80,6 +81,10 @@ class TD0:
         assert next_value.shape == (bs, 1)
         return reward + self.discount_factor * not_done * next_value - curr_value
 
+    # Risk not implemented for TD0
+    def risk(self, next_obs, not_done):
+        return torch.zeros_like(not_done)
+
     def update(self, obs, reward, next_obs, not_done):
         bs = obs.shape[0]
         assert obs.shape == (bs, *self.obs_shape)
@@ -99,7 +104,7 @@ class TD0:
 
 
 class CategoricalTD0:
-    def __init__(self, net, optimizer, discount_factor, obs_shape, num_atoms, v_min, v_max):
+    def __init__(self, net, optimizer, discount_factor, obs_shape, num_atoms, v_min, v_max, risk_measure):
         assert num_atoms > 1
         assert v_max > v_min
         self.net = net
@@ -109,17 +114,22 @@ class CategoricalTD0:
         self.num_atoms = num_atoms
         self.v_min = v_min
         self.v_max = v_max
+        self.risk_measure = risk_measure
         self.atom_delta = (v_max - v_min) / (num_atoms - 1)
         self.atom_values = torch.FloatTensor([v_min + self.atom_delta * i for i in range(self.num_atoms)])
         self.projection = utils.CategoricalProjection(v_min=v_min, v_max=v_max, num_atoms=num_atoms,
                                                       discount_factor=discount_factor)
 
-    def _exp_value(self, obs):
+    def _probs(self, obs):
         bs = obs.shape[0]
         assert obs.shape == (bs, *self.obs_shape)
         logits = self.net(obs)
         assert logits.shape == (bs, self.num_atoms)
-        probs = F.softmax(logits, dim=1)
+        return F.softmax(logits, dim=1)
+
+    def _exp_value(self, obs):
+        bs = obs.shape[0]
+        probs = self._probs(obs=obs)
         exp_value = (probs * self.atom_values).sum(dim=1).unsqueeze(1)
         assert exp_value.shape == (bs, 1)
         return exp_value
@@ -136,6 +146,17 @@ class CategoricalTD0:
         assert curr_exp_value.shape == (bs, 1)
         assert next_exp_value.shape == (bs, 1)
         return reward + self.discount_factor * not_done * next_exp_value - curr_exp_value
+
+    def risk(self, next_obs, not_done):
+        bs = next_obs.shape[0]
+        assert next_obs.shape == (bs, *self.obs_shape)
+        assert not_done.shape == (bs, 1)
+        if self.risk_measure is None:
+            return torch.zeros_like(not_done)
+        next_probs = self._probs(obs=next_obs)
+        risk = self.risk_measure(probs=next_probs, atom_values=self.atom_values) * not_done
+        assert risk.shape == (bs, 1)
+        return risk
 
     def update(self, obs, reward, next_obs, not_done):
         bs = obs.shape[0]
@@ -159,7 +180,7 @@ class CategoricalTD0:
 
 
 class PPO:
-    def __init__(self, env, actor, critic, actor_optimizer, clip_epsilon, entropy_coef, kl_coef, target_kl,
+    def __init__(self, env, actor, critic, actor_optimizer, clip_epsilon, entropy_coef, kl_coef, risk_coef, target_kl,
                  num_train_iters, steps_per_iter, num_actor_epochs, num_critic_epochs, batch_size,
                  save_interval, run_dir):
         if save_interval is not None:
@@ -171,6 +192,7 @@ class PPO:
         self.clip_epsilon = clip_epsilon
         self.entropy_coef = entropy_coef
         self.kl_coef = kl_coef
+        self.risk_coef = risk_coef
         self.target_kl = target_kl
         self.num_train_iters = num_train_iters
         self.steps_per_iter = steps_per_iter
@@ -229,9 +251,11 @@ class PPO:
         assert not_done.shape == (num_transitions, 1)
 
         advantage = self.critic.advantage(obs=obs, next_obs=next_obs, reward=reward, not_done=not_done).detach()
+        risk = self.critic.risk(next_obs=next_obs, not_done=not_done).detach()
         assert advantage.shape == (num_transitions, 1)
         distribution_params = (x.detach() for x in self.actor.distribution_params(obs))
-        return torch.utils.data.TensorDataset(obs, action, reward, next_obs, not_done, advantage, *distribution_params)
+        return torch.utils.data.TensorDataset(obs, action, reward, next_obs, not_done, advantage, risk,
+                                              *distribution_params)
 
     def update(self, transitions):
         dataset = self._create_dataset(transitions)
@@ -253,9 +277,11 @@ class PPO:
             actor_losses = []
             entropies = []
             kl_divergences = []
-            for (obs, action, reward, next_obs, not_done, advantage, *old_distribution_params) in data_loader:
+            risks = []
+            for (obs, action, reward, next_obs, not_done, advantage, risk, *old_distribution_params) in data_loader:
                 bs = obs.shape[0]
                 assert advantage.shape == (bs, 1)
+                assert risk.shape == (bs, 1)
                 old_probs = self.actor.probs(old_distribution_params, action)
                 assert old_probs.shape == (bs, 1)
                 new_distribution_params = self.actor.distribution_params(obs)
@@ -263,7 +289,8 @@ class PPO:
                 assert new_probs.shape == (bs, 1)
                 prob_ratio = new_probs / old_probs
                 prob_ratio_clip = torch.clamp(prob_ratio, min=1 - self.clip_epsilon, max=1 + self.clip_epsilon)
-                clip_loss = -torch.min(prob_ratio * advantage, prob_ratio_clip * advantage).mean()
+                risk_adj_advantage = (advantage - self.risk_coef * risk).detach()
+                clip_loss = -torch.min(prob_ratio * risk_adj_advantage, prob_ratio_clip * risk_adj_advantage).mean()
                 entropy = self.actor.entropy(new_distribution_params)
                 kl_divergence = self.actor.kl_divergence(old_distribution_params, new_distribution_params)
                 actor_loss = clip_loss - self.entropy_coef * entropy + self.kl_coef * kl_divergence
@@ -273,13 +300,15 @@ class PPO:
                 actor_losses.append(actor_loss.item() * bs)
                 entropies.append(entropy.item() * bs)
                 kl_divergences.append(kl_divergence.item() * bs)
+                risks.append(risk.mean().item() * bs)
             avg_actor_loss = sum(actor_losses) / len(dataset)
             avg_entropy = sum(entropies) / len(dataset)
             avg_kl = sum(kl_divergences) / len(dataset)
+            avg_risk = sum(risks) / len(dataset)
             if avg_kl <= self.target_kl:
                 best_actor_state = copy.deepcopy(self.actor.net.state_dict())
                 metrics = {**metrics, 'actor_loss': avg_actor_loss, 'entropy': avg_entropy, 'kl': avg_kl,
-                           'best_epoch': epoch}
+                           'risk': avg_risk, 'best_epoch': epoch}
         self.actor.net.load_state_dict(best_actor_state)
 
         return metrics
@@ -324,6 +353,8 @@ def main():
     parser.add_argument('--clip_epsilon', type=float, default=0.2)
     parser.add_argument('--entropy_coef', type=float, default=0.5)
     parser.add_argument('--kl_coef', type=float, default=0.)
+    parser.add_argument('--risk_coef', type=float, default=0.)
+    parser.add_argument('--risk_measure', choices=('noop', 'variance'), default='noop')
     parser.add_argument('--target_kl', type=float, default=0.05)
     parser.add_argument('--num_train_iters', type=int, default=50)
     parser.add_argument('--steps_per_iter', type=int, default=4000)
@@ -375,9 +406,13 @@ def main():
     actor = DiscretePolicy(net=policy_net, obs_shape=obs_shape, num_actions=num_actions)
     actor_optimizer = torch.optim.Adam(policy_net.parameters(), lr=args.actor_learning_rate)
     critic_optimizer = torch.optim.Adam(critic_net.parameters(), lr=args.critic_learning_rate)
+
     if args.use_categorical:
+        risk_measure = agents.risk.get_measure(args.risk_measure)
+        print(f'Using risk_measure: {risk_measure.__name__}')
         critic = CategoricalTD0(net=critic_net, optimizer=critic_optimizer, discount_factor=args.discount_factor,
-                                obs_shape=obs_shape, num_atoms=args.num_atoms, v_min=args.v_min, v_max=args.v_max)
+                                obs_shape=obs_shape, num_atoms=args.num_atoms, v_min=args.v_min, v_max=args.v_max,
+                                risk_measure=risk_measure)
     else:
         critic = TD0(net=critic_net, optimizer=critic_optimizer, discount_factor=args.discount_factor,
                      obs_shape=obs_shape)
@@ -390,6 +425,7 @@ def main():
         clip_epsilon=args.clip_epsilon,
         entropy_coef=args.entropy_coef,
         kl_coef=args.kl_coef,
+        risk_coef=args.risk_coef,
         target_kl=args.target_kl,
         num_train_iters=args.num_train_iters,
         steps_per_iter=args.steps_per_iter,
