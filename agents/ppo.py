@@ -2,15 +2,18 @@ import argparse
 import copy
 import json
 import os
-import warnings
 
 import gym
+import gym.spaces as spaces
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
+from torch.distributions.multivariate_normal import MultivariateNormal
 
-import ai_safety_gridworlds
 import agents.utils as utils
+import ai_safety_gridworlds  # pylint: disable=unused-import
+import envs  # pylint: disable=unused-import
 
 
 class DiscretePolicy:
@@ -18,6 +21,9 @@ class DiscretePolicy:
         self.net = net
         self.obs_shape = obs_shape
         self.num_actions = num_actions
+
+    def __str__(self):
+        return utils.stringify(self)
 
     def sample_action(self, obs):
         assert obs.shape == self.obs_shape
@@ -60,12 +66,87 @@ class DiscretePolicy:
             Categorical(probs=distribution_params2[0])).mean()
 
 
+class GaussianPolicy:
+    def __init__(self, net, obs_shape, action_shape, action_low, action_high):
+        self.net = net
+        self.obs_shape = obs_shape
+        self.action_shape = action_shape
+        self.action_low = action_low
+        self.action_high = action_high
+
+    def __str__(self):
+        return utils.stringify(self)
+
+    def sample_action(self, obs):
+        assert obs.shape == self.obs_shape
+        obs = torch.FloatTensor(obs).unsqueeze(0)
+        assert obs.shape == (1, *self.obs_shape)
+        distribution_params = self.distribution_params(obs)
+        distribution = self._create_distribution(distribution_params)
+        action = distribution.sample()
+        assert action.shape == (1, *self.action_shape)
+        action = action.squeeze(0).numpy()
+        action = np.clip(action, a_max=self.action_high, a_min=self.action_low)
+        return action
+
+    def distribution_params(self, obs):
+        bs = obs.shape[0]
+        assert obs.shape == (bs, *self.obs_shape)
+        mean, variance = self.net(obs)
+        assert mean.shape == (bs, *self.action_shape)
+        assert variance.shape == (bs, *self.action_shape)
+        return mean, variance
+
+    def _validate_distribution_params(self, distribution_params):
+        assert len(distribution_params) == 2
+        mean, variance = distribution_params
+        bs = mean.shape[0]
+        assert mean.shape == (bs, *self.action_shape)
+        assert variance.shape == (bs, *self.action_shape)
+
+    def _create_distribution(self, distribution_params):
+        self._validate_distribution_params(distribution_params)
+        mean, variance = distribution_params
+        bs = mean.shape[0]
+        assert mean.shape == (bs, *self.action_shape)
+        assert variance.shape == (bs, *self.action_shape)
+        covariance = torch.diag_embed(variance)
+        dets = torch.det(covariance)
+        if not torch.all(dets > 0):
+            print('singular covariance matrix detected')
+            print('dets:', dets)
+            print('covariance:', covariance)
+        distribution = MultivariateNormal(loc=mean, covariance_matrix=covariance)
+        return distribution
+
+    def probs(self, distribution_params, action):
+        bs = action.shape[0]
+        distribution = self._create_distribution(distribution_params)
+        log_probs = distribution.log_prob(action).unsqueeze(1)
+        assert log_probs.shape == (bs, 1)
+        probs = torch.exp(log_probs)
+        assert probs.shape == (bs, 1)
+        return probs
+
+    def entropy(self, distribution_params):
+        distribution = self._create_distribution(distribution_params)
+        return distribution.entropy().mean()
+
+    def kl_divergence(self, distribution_params1, distribution_params2):
+        distribution1 = self._create_distribution(distribution_params1)
+        distribution2 = self._create_distribution(distribution_params2)
+        return torch.distributions.kl.kl_divergence(distribution1, distribution2).mean()
+
+
 class TD0:
     def __init__(self, net, optimizer, discount_factor, obs_shape):
         self.net = net
         self.optimizer = optimizer
         self.discount_factor = discount_factor
         self.obs_shape = obs_shape
+
+    def __str__(self):
+        return utils.stringify(self)
 
     def advantage(self, obs, next_obs, reward, not_done):
         bs = obs.shape[0]
@@ -113,6 +194,9 @@ class CategoricalTD0:
         self.atom_values = torch.FloatTensor([v_min + self.atom_delta * i for i in range(self.num_atoms)])
         self.projection = utils.CategoricalProjection(v_min=v_min, v_max=v_max, num_atoms=num_atoms,
                                                       discount_factor=discount_factor)
+
+    def __str__(self):
+        return utils.stringify(self)
 
     def _exp_value(self, obs):
         bs = obs.shape[0]
@@ -182,6 +266,8 @@ class PPO:
 
         self._obs = self.env.reset()
         self._obs_shape = self._obs.shape
+        self._is_action_discrete = isinstance(env.action_space, spaces.Discrete)
+        self._action_shape = (1,) if self._is_action_discrete else env.action_space.shape
         self._curr_return = 0.
         self._metrics = []
         if self.run_dir is not None:
@@ -217,14 +303,16 @@ class PPO:
 
     def _create_dataset(self, transitions):
         obs = torch.FloatTensor([x.obs for x in transitions])
-        action = torch.LongTensor([x.action for x in transitions]).unsqueeze(1)
+        action = torch.LongTensor([x.action for x in transitions])
+        if self._is_action_discrete:
+            action = action.unsqueeze(1)
         reward = torch.FloatTensor([x.reward for x in transitions]).unsqueeze(1)
         next_obs = torch.FloatTensor([x.next_obs for x in transitions])
         not_done = torch.FloatTensor([0. if x.done else 1. for x in transitions]).unsqueeze(1)
         num_transitions = len(transitions)
         assert obs.shape == (num_transitions, *self._obs_shape)
         assert next_obs.shape == (num_transitions, *self._obs_shape)
-        assert action.shape == (num_transitions, 1)
+        assert action.shape == (num_transitions, *self._action_shape), f'invalid action shape: {action.shape}'
         assert reward.shape == (num_transitions, 1)
         assert not_done.shape == (num_transitions, 1)
 
@@ -234,6 +322,7 @@ class PPO:
         return torch.utils.data.TensorDataset(obs, action, reward, next_obs, not_done, advantage, *distribution_params)
 
     def update(self, transitions):
+        # Create Dataset
         dataset = self._create_dataset(transitions)
         data_loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         metrics = {}
@@ -256,6 +345,8 @@ class PPO:
             for (obs, action, reward, next_obs, not_done, advantage, *old_distribution_params) in data_loader:
                 bs = obs.shape[0]
                 assert advantage.shape == (bs, 1)
+                # Normalize Advantage
+                advantage = ((advantage - advantage.mean()) / (advantage.std() + 1e-5)).detach()
                 old_probs = self.actor.probs(old_distribution_params, action)
                 assert old_probs.shape == (bs, 1)
                 new_distribution_params = self.actor.distribution_params(obs)
@@ -284,6 +375,12 @@ class PPO:
 
         return metrics
 
+    def _save_models(self, path):
+        torch.save({
+            'actor': self.actor.net.state_dict(),
+            'critic': self.critic.net.state_dict(),
+        }, path)
+
     def log_metrics(self, train_iter, metrics):
         metrics_strs = [f'{k}: {v:.04f}' for k, v in metrics.items()]
         metrics_str = ' | '.join(metrics_strs)
@@ -294,18 +391,12 @@ class PPO:
         # Save model at regular interval
         if self.save_interval is not None and train_iter % self.save_interval == 0:
             save_path = os.path.join(self.models_dir, f'step-{step}.pt')
-            with open(save_path, 'wb') as f:
-                with warnings.catch_warnings():
-                    warnings.simplefilter('ignore')
-                    torch.save(self, f)
+            self._save_models(save_path)
             print(f'  Wrote checkpoint to: {save_path}')
         # Save final model and run metrics at the end
-        if train_iter == self.num_train_iters:
+        if train_iter == self.num_train_iters and self.run_dir is not None:
             model_path = os.path.join(self.run_dir, f'final-model-{step}.pt')
-            with open(model_path, 'wb') as f:
-                with warnings.catch_warnings():
-                    warnings.simplefilter('ignore')
-                    torch.save(self, f)
+            self._save_models(model_path)
             print(f'  Wrote final model to: {model_path}')
             metrics_path = os.path.join(self.run_dir, 'metrics.json')
             with open(metrics_path, 'w') as f:
@@ -313,23 +404,82 @@ class PPO:
             print(f'  Wrote run metrics to: {metrics_path}')
 
 
+def _create_policy(env, args):
+    obs_shape = env.observation_space.shape
+
+    if len(obs_shape) == 3:
+        assert isinstance(env.action_space, spaces.Discrete), f'unsupport action_space: {env.action_space}'
+        conv_kwargs = {'obs_shape': obs_shape, 'kernel_sizes': args.kernel_sizes, 'channel_sizes': args.channel_sizes,
+                       'paddings': args.paddings}
+        num_actions = env.action_space.n
+        policy_layer_sizes = args.actor_hidden_sizes + [num_actions]
+        policy_net = utils.create_conv_net(fc_sizes=policy_layer_sizes, **conv_kwargs)
+        return DiscretePolicy(net=policy_net, obs_shape=obs_shape, num_actions=num_actions)
+
+    assert len(obs_shape) == 1, f'unsupported obs_shape: {obs_shape}'
+    if isinstance(env.action_space, spaces.Discrete):
+        num_actions = env.action_space.n
+        policy_layer_sizes = [obs_shape[0]] + args.actor_hidden_sizes + [num_actions]
+        policy_net = utils.create_mlp(policy_layer_sizes)
+        return DiscretePolicy(net=policy_net, obs_shape=obs_shape, num_actions=num_actions)
+
+    action_shape = env.action_space.shape
+    assert len(action_shape) == 1
+    max_action_high = np.abs(env.action_space.high).max()
+    max_action_low = np.abs(env.action_space.low).max()
+    assert not np.isinf(max_action_high) and not np.isinf(max_action_low)
+    max_action = max(max_action_high.item(), max_action_low.item())
+    policy_net = utils.GaussianMlp(obs_shape=obs_shape, action_shape=action_shape,
+                                   hidden_sizes=args.actor_hidden_sizes, max_action=max_action,
+                                   min_variance=args.min_variance, max_variance=args.max_variance)
+    return GaussianPolicy(net=policy_net, obs_shape=obs_shape, action_shape=action_shape,
+                          action_low=env.action_space.low, action_high=env.action_space.high)
+
+
+def _create_critic(env, args):
+    obs_shape = env.observation_space.shape
+    last_layer_size = 1
+    if args.use_categorical:
+        last_layer_size = args.num_atoms
+
+    if len(obs_shape) == 3:
+        assert isinstance(env.action_space, spaces.Discrete), f'unsupported action_space: {env.action_space}'
+        conv_kwargs = {'obs_shape': obs_shape, 'kernel_sizes': args.kernel_sizes, 'channel_sizes': args.channel_sizes,
+                       'paddings': args.paddings}
+        critic_layer_sizes = args.critic_hidden_sizes + [last_layer_size]
+        critic_net = utils.create_conv_net(fc_sizes=critic_layer_sizes, **conv_kwargs)
+    else:
+        assert len(obs_shape) == 1, f'unsupport obs_shape: {obs_shape}'
+        critic_layer_sizes = [obs_shape[0]] + args.critic_hidden_sizes + [last_layer_size]
+        critic_net = utils.create_mlp(critic_layer_sizes)
+
+    critic_optimizer = torch.optim.Adam(critic_net.parameters(), lr=args.critic_learning_rate)
+    if args.use_categorical:
+        return CategoricalTD0(net=critic_net, optimizer=critic_optimizer, discount_factor=args.discount_factor,
+                              obs_shape=obs_shape, num_atoms=args.num_atoms, v_min=args.v_min, v_max=args.v_max)
+
+    return TD0(net=critic_net, optimizer=critic_optimizer, discount_factor=args.discount_factor,
+               obs_shape=obs_shape)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', default='CartPole-v1')
-    parser.add_argument('--actor_hidden_sizes', nargs='*', type=int, default=[32])
-    parser.add_argument('--critic_hidden_sizes', nargs='*', type=int, default=[32])
-    parser.add_argument('--actor_learning_rate', type=float, default=0.0001)
-    parser.add_argument('--critic_learning_rate', type=float, default=0.0005)
+    parser.add_argument('--actor_hidden_sizes', nargs='*', type=int, default=[64, 64])
+    parser.add_argument('--critic_hidden_sizes', nargs='*', type=int, default=[64, 64])
+    parser.add_argument('--actor_learning_rate', type=float, default=3e-5)
+    parser.add_argument('--actor_weight_decay', type=float, default=0.)
+    parser.add_argument('--critic_learning_rate', type=float, default=3e-4)
     parser.add_argument('--discount_factor', type=float, default=0.99)
     parser.add_argument('--clip_epsilon', type=float, default=0.2)
-    parser.add_argument('--entropy_coef', type=float, default=0.5)
+    parser.add_argument('--entropy_coef', type=float, default=0.)
     parser.add_argument('--kl_coef', type=float, default=0.)
     parser.add_argument('--target_kl', type=float, default=0.05)
     parser.add_argument('--num_train_iters', type=int, default=50)
     parser.add_argument('--steps_per_iter', type=int, default=4000)
-    parser.add_argument('--num_actor_epochs', type=int, default=20)
-    parser.add_argument('--num_critic_epochs', type=int, default=40)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--num_actor_epochs', type=int, default=80)
+    parser.add_argument('--num_critic_epochs', type=int, default=80)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--save_interval', type=int)
     parser.add_argument('--run_dir')
     # Categorical Arguments
@@ -341,6 +491,9 @@ def main():
     parser.add_argument('--kernel_sizes', type=int, nargs='+', default=[5, 5, 3])
     parser.add_argument('--paddings', type=int, nargs='+', default=[2, 0, 0])
     parser.add_argument('--channel_sizes', type=int, nargs='+', default=[16, 32, 32])
+    # Continuous Action Space
+    parser.add_argument('--min_variance', type=float, default=1e-6)
+    parser.add_argument('--max_variance', type=float, default=float('inf'))
     args = parser.parse_args()
     print(json.dumps(args.__dict__, indent=2))
 
@@ -351,36 +504,12 @@ def main():
             json.dump(args.__dict__, f)
 
     env = gym.make(args.env_name)
-    obs_shape = env.observation_space.shape
-    num_actions = env.action_space.n
-    print('obs_shape:', obs_shape)
-
-    policy_layer_sizes = args.actor_hidden_sizes + [num_actions]
-    critic_layer_sizes = args.critic_hidden_sizes + [1]
-    if args.use_categorical:
-        critic_layer_sizes[-1] = args.num_atoms
-    if len(obs_shape) == 3:
-        conv_kwargs = {'obs_shape': obs_shape, 'kernel_sizes': args.kernel_sizes, 'channel_sizes': args.channel_sizes,
-                       'paddings': args.paddings}
-        policy_net = utils.create_conv_net(fc_sizes=policy_layer_sizes, **conv_kwargs)
-        critic_net = utils.create_conv_net(fc_sizes=critic_layer_sizes, **conv_kwargs)
-    else:
-        policy_layer_sizes = [obs_shape[0]] + policy_layer_sizes
-        critic_layer_sizes = [obs_shape[0]] + critic_layer_sizes
-        policy_net = utils.create_mlp(policy_layer_sizes)
-        critic_net = utils.create_mlp(critic_layer_sizes)
-    print('policy_net:', policy_net)
-    print('critic_net:', critic_net)
-
-    actor = DiscretePolicy(net=policy_net, obs_shape=obs_shape, num_actions=num_actions)
-    actor_optimizer = torch.optim.Adam(policy_net.parameters(), lr=args.actor_learning_rate)
-    critic_optimizer = torch.optim.Adam(critic_net.parameters(), lr=args.critic_learning_rate)
-    if args.use_categorical:
-        critic = CategoricalTD0(net=critic_net, optimizer=critic_optimizer, discount_factor=args.discount_factor,
-                                obs_shape=obs_shape, num_atoms=args.num_atoms, v_min=args.v_min, v_max=args.v_max)
-    else:
-        critic = TD0(net=critic_net, optimizer=critic_optimizer, discount_factor=args.discount_factor,
-                     obs_shape=obs_shape)
+    actor = _create_policy(env, args)
+    critic = _create_critic(env, args)
+    print(actor)
+    print(critic)
+    actor_optimizer = torch.optim.Adam(actor.net.parameters(), lr=args.actor_learning_rate,
+                                       weight_decay=args.actor_weight_decay)
 
     ppo = PPO(
         env=env,

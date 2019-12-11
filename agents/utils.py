@@ -2,8 +2,19 @@ from collections import namedtuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 Transition = namedtuple('Transition', ('obs', 'action', 'reward', 'next_obs', 'done'))
+
+
+def stringify(instance):
+    name = instance.__class__.__name__
+    result = name + '(\n'
+    for k, v in instance.__dict__.items():
+        v = str(v)
+        result += f'  {k}: {v}\n'
+    result += ')'
+    return result
 
 
 def create_mlp(layer_sizes):
@@ -42,6 +53,34 @@ def create_conv_net(obs_shape, kernel_sizes, paddings, channel_sizes, fc_sizes):
         input_size = output_size
     layers.pop()
     return nn.Sequential(*layers)
+
+
+class GaussianMlp(nn.Module):
+    def __init__(self, obs_shape, action_shape, hidden_sizes, max_action, min_variance, max_variance):
+        super().__init__()
+        assert len(obs_shape) == 1, f'unsupported obs_shape: {obs_shape}'
+        assert len(action_shape) == 1, f'unsupported action_shape: {action_shape}'
+        self.obs_shape = obs_shape
+        self.action_shape = action_shape
+        self.max_action = max_action
+        self.min_variance = min_variance
+        self.max_variance = max_variance
+
+        body_layer_sizes = [obs_shape[0]] + hidden_sizes
+        last_hidden_size = body_layer_sizes[-1]
+        action_size = action_shape[0]
+        self.body = create_mlp(body_layer_sizes)
+        self.mean_head = nn.Linear(last_hidden_size, action_size)
+        self.var_head = nn.Linear(last_hidden_size, action_size)
+
+    def forward(self, x):
+        bs = x.shape[0]
+        assert x.shape == (bs, *self.obs_shape)
+        x = torch.tanh(self.body(x))
+        mean = torch.tanh(self.mean_head(x)) * self.max_action
+        var = F.softplus(self.var_head(x))
+        var = torch.clamp(var, min=self.min_variance, max=self.max_variance)
+        return mean, var
 
 
 class CategoricalProjection(nn.Module):
