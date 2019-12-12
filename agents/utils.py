@@ -106,28 +106,17 @@ class CategoricalProjection(nn.Module):
         new_atom_values = reward + self.discount_factor * not_done * atom_values
         new_atom_values = torch.clamp(new_atom_values, min=self.v_min, max=self.v_max)
 
-        new_atom_indices = (new_atom_values - self.v_min) / self.atom_delta
-        lower_index = torch.floor(new_atom_indices)
-        upper_index = torch.ceil(new_atom_indices)
-        lower_coef = upper_index - new_atom_indices
-        upper_coef = new_atom_indices - lower_index
+        # Fast projection borrowed from here:
+        # https://github.com/ShangtongZhang/DeepRL/blob/master/deep_rl/agent/CategoricalDQN_agent.py#L108
+        b = (new_atom_values - self.v_min) / self.atom_delta
+        l = b.floor()
+        u = b.ceil()
+        d_m_l = (u + (l == u).float() - b) * probs
+        d_m_u = (b - l) * probs
 
-        projection_matrix = torch.zeros((bs, self.num_atoms, self.num_atoms))
+        new_probs = torch.zeros_like(probs)
         for i in range(bs):
-            for j in range(self.num_atoms):
-                l = int(lower_index[i, j].item())
-                l_coef = lower_coef[i, j]
-                u = int(upper_index[i, j].item())
-                u_coef = upper_coef[i, j]
-                projection_matrix[i, l, j] = l_coef
-                projection_matrix[i, u, j] = u_coef
-                if l == u:
-                    assert l_coef == 0
-                    assert u_coef == 0
-                    projection_matrix[i, l, j] = 1.
+            new_probs[i].index_add_(0, l[i].long(), d_m_l[i])
+            new_probs[i].index_add_(0, u[i].long(), d_m_u[i])
 
-        probs = probs.unsqueeze(-1)
-        assert probs.shape == (bs, self.num_atoms, 1)
-        new_probs = torch.bmm(projection_matrix, probs).squeeze(-1)
-        assert new_probs.shape == (bs, self.num_atoms)
         return new_probs

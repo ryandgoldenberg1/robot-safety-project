@@ -13,7 +13,6 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 
 import agents.utils as utils
 import ai_safety_gridworlds  # pylint: disable=unused-import
-import envs  # pylint: disable=unused-import
 
 
 class DiscretePolicy:
@@ -148,6 +147,9 @@ class TD0:
     def __str__(self):
         return utils.stringify(self)
 
+    def exp_value(self, obs):
+        return self.net(obs)
+
     def advantage(self, obs, next_obs, reward, not_done):
         bs = obs.shape[0]
         assert obs.shape == (bs, *self.obs_shape)
@@ -169,7 +171,7 @@ class TD0:
         assert not_done.shape == (bs, 1)
 
         target_value = (reward + self.discount_factor * not_done * self.net(next_obs)).detach()
-        assert target_value.shape == (bs, 1)
+        assert target_value.shape == (bs, 1), f'invalid target_value shape: {target_value.shape}'
         pred_value = self.net(obs)
         assert pred_value.shape == (bs, 1)
         loss = F.mse_loss(input=pred_value, target=target_value)
@@ -198,7 +200,7 @@ class CategoricalTD0:
     def __str__(self):
         return utils.stringify(self)
 
-    def _exp_value(self, obs):
+    def exp_value(self, obs):
         bs = obs.shape[0]
         assert obs.shape == (bs, *self.obs_shape)
         logits = self.net(obs)
@@ -215,8 +217,8 @@ class CategoricalTD0:
         assert reward.shape == (bs, 1)
         assert not_done.shape == (bs, 1)
 
-        curr_exp_value = self._exp_value(obs)
-        next_exp_value = self._exp_value(next_obs)
+        curr_exp_value = self.exp_value(obs)
+        next_exp_value = self.exp_value(next_obs)
         assert curr_exp_value.shape == (bs, 1)
         assert next_exp_value.shape == (bs, 1)
         return reward + self.discount_factor * not_done * next_exp_value - curr_exp_value
@@ -303,9 +305,10 @@ class PPO:
 
     def _create_dataset(self, transitions):
         obs = torch.FloatTensor([x.obs for x in transitions])
-        action = torch.LongTensor([x.action for x in transitions])
         if self._is_action_discrete:
-            action = action.unsqueeze(1)
+            action = torch.LongTensor([x.action for x in transitions]).unsqueeze(1)
+        else:
+            action = torch.FloatTensor([x.action for x in transitions])
         reward = torch.FloatTensor([x.reward for x in transitions]).unsqueeze(1)
         next_obs = torch.FloatTensor([x.next_obs for x in transitions])
         not_done = torch.FloatTensor([0. if x.done else 1. for x in transitions]).unsqueeze(1)
@@ -467,19 +470,19 @@ def main():
     parser.add_argument('--env_name', default='CartPole-v1')
     parser.add_argument('--actor_hidden_sizes', nargs='*', type=int, default=[64, 64])
     parser.add_argument('--critic_hidden_sizes', nargs='*', type=int, default=[64, 64])
-    parser.add_argument('--actor_learning_rate', type=float, default=3e-5)
+    parser.add_argument('--actor_learning_rate', type=float, default=0.0003)
     parser.add_argument('--actor_weight_decay', type=float, default=0.)
-    parser.add_argument('--critic_learning_rate', type=float, default=3e-4)
+    parser.add_argument('--critic_learning_rate', type=float, default=0.01)
     parser.add_argument('--discount_factor', type=float, default=0.99)
     parser.add_argument('--clip_epsilon', type=float, default=0.2)
     parser.add_argument('--entropy_coef', type=float, default=0.)
     parser.add_argument('--kl_coef', type=float, default=0.)
-    parser.add_argument('--target_kl', type=float, default=0.05)
+    parser.add_argument('--target_kl', type=float, default=0.03)
     parser.add_argument('--num_train_iters', type=int, default=50)
     parser.add_argument('--steps_per_iter', type=int, default=4000)
     parser.add_argument('--num_actor_epochs', type=int, default=80)
     parser.add_argument('--num_critic_epochs', type=int, default=80)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=4000)
     parser.add_argument('--save_interval', type=int)
     parser.add_argument('--run_dir')
     # Categorical Arguments
