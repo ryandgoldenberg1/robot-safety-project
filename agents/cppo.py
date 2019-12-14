@@ -131,6 +131,7 @@ class CPPO:
                 self._curr_cost = 0.
             metrics = {}
             if len(returns) > 0:
+                metrics['episodes'] = len(returns)
                 metrics['avg_return'] = sum(returns) / len(returns)
                 metrics['avg_cost'] = sum(costs) / len(costs)
                 metrics['violation'] = sum(violations) / len(violations)
