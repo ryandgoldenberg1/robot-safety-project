@@ -4,3 +4,4 @@ __pycache__/
 tmp
 runs
 MUJOCO_LOG.TXT
+run_log.sh
