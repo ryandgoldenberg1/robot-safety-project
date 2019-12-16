@@ -68,12 +68,13 @@ class MeanRisk(nn.Module):
 
 
 class ExpUtilityRisk(nn.Module):
-    def __init__(self, discount_factor, temperature):
+    def __init__(self, discount_factor, temperature, max_atom_value):
         assert 0 <= discount_factor <= 1
         assert temperature > 0
         super().__init__()
         self.discount_factor = discount_factor
         self.temperature = temperature
+        self.max_atom_value = max_atom_value
 
     def __str__(self):
         return f"ExpUtilityRisk(\n  discount_factor: {self.discount_factor}\n  temperature: {self.temperature}\n)"
@@ -82,7 +83,9 @@ class ExpUtilityRisk(nn.Module):
         bs, num_atoms = atom_values.shape
         assert atom_values.shape == (bs, num_atoms)
         assert atom_probs.shape == (bs, num_atoms)
-        x = torch.exp(self.temperature * atom_values)
+        x = torch.clamp(self.temperature * atom_values, max=self.max_atom_value)
+        assert x.shape == (bs, num_atoms)
+        x = torch.exp(x)
         assert x.shape == (bs, num_atoms)
         x = (atom_probs * x).sum(dim=1).unsqueeze(1)
         assert x.shape == (bs, 1)
@@ -96,6 +99,7 @@ class ExpUtilityRisk(nn.Module):
         bs = curr_atom_probs.shape[0]
         num_atoms = atom_values.shape[0]
 
+        threshold = torch.clamp(threshold, min=0.)
         curr_atom_values = atom_values.expand((bs, num_atoms)) - threshold.expand((bs, num_atoms))
         next_atom_values = cost.expand((bs, num_atoms)) + \
             self.discount_factor * not_done * atom_values.expand((bs, num_atoms)) - threshold.expand((bs, num_atoms))
@@ -134,6 +138,7 @@ class ClippedVarRisk(nn.Module):
         bs = curr_atom_probs.shape[0]
         num_atoms = atom_values.shape[0]
 
+        threshold = torch.clamp(threshold, min=0.)
         curr_atom_values = atom_values.expand((bs, num_atoms)) - threshold.expand((bs, num_atoms)) + self.margin
         next_atom_values = cost.expand((bs, num_atoms)) + \
             self.discount_factor * not_done * atom_values.expand((bs, num_atoms)) - \

@@ -61,7 +61,8 @@ class CTD0:
 
 class CPPOHyperparameters:
     def __init__(self, num_train_iters, steps_per_iter, save_interval, run_dir, cost_threshold, batch_size,
-                 num_actor_epochs, num_critic_epochs, clip_epsilon, entropy_coef, kl_coef, target_kl):
+                 num_actor_epochs, num_critic_epochs, clip_epsilon, entropy_coef, kl_coef, target_kl,
+                 stop_extra_early):
         if save_interval is not None:
             assert run_dir is not None
         self.num_train_iters = num_train_iters
@@ -76,6 +77,7 @@ class CPPOHyperparameters:
         self.entropy_coef = entropy_coef
         self.kl_coef = kl_coef
         self.target_kl = target_kl
+        self.stop_extra_early = stop_extra_early
 
     def __str__(self):
         return utils.stringify(self)
@@ -158,7 +160,7 @@ class CPPO:
         advantage, reward_advantage, risk_advantage = self.critic.advantage(
             obs=obs, next_obs=next_obs, reward=reward, cost=cost, not_done=not_done, threshold=threshold,
             curr_return=curr_return, train_iter=train_iter)
-        advantage.detach_()
+        advantage = advantage.detach()
         distribution_params = (x.detach() for x in self.actor.distribution_params(obs))
         dataset = torch.utils.data.TensorDataset(obs, action, reward, cost, next_obs, not_done, advantage,
                                                  *distribution_params)
@@ -236,6 +238,8 @@ class CPPO:
                 metrics['actor_loss'] = epoch_loss
             if epoch == 1:
                 metrics['start_actor_loss'] = epoch_loss
+            if epoch_kl > self.hp.target_kl and self.hp.stop_extra_early:
+                break
         self.actor.net.load_state_dict(best_actor_state)
         return metrics
 
@@ -289,7 +293,7 @@ def create_actor(env, hidden_sizes, min_variance, max_variance):
 
 def create_critic(env, hidden_sizes, discount_factor, learning_rate, num_atoms, cost_min, cost_max, risk_type,
                   risk_init_coef, risk_end_coef, risk_warmup_steps, risk_grow_steps, risk_temperature,
-                  risk_margin):
+                  risk_margin, risk_max_value):
     obs_shape = env.observation_space.shape
     assert len(obs_shape) == 1
 
@@ -305,7 +309,8 @@ def create_critic(env, hidden_sizes, discount_factor, learning_rate, num_atoms, 
     if risk_type == 'mean':
         risk_measure = risk.MeanRisk(discount_factor=discount_factor)
     if risk_type == 'exp':
-        risk_measure = risk.ExpUtilityRisk(discount_factor=discount_factor, temperature=risk_temperature)
+        risk_measure = risk.ExpUtilityRisk(discount_factor=discount_factor, temperature=risk_temperature,
+                                           max_atom_value=risk_max_value)
     if risk_type == 'var':
         risk_measure = risk.ClippedVarRisk(discount_factor=discount_factor, margin=risk_margin)
     risk_schedule = risk.LinearSchedule(init_value=risk_init_coef, end_value=risk_end_coef,
@@ -339,6 +344,7 @@ def main():
     parser.add_argument('--risk_warmup_steps', type=int, default=30)
     parser.add_argument('--risk_grow_steps', type=int, default=90)
     parser.add_argument('--risk_temperature', type=float, default=0.2)
+    parser.add_argument('--risk_max_value', type=float, default=30.)
     parser.add_argument('--risk_margin', type=float, default=1.)
     # CPPO Hyperparameters
     parser.add_argument('--num_train_iters', type=int, default=350)
@@ -352,6 +358,7 @@ def main():
     parser.add_argument('--kl_coef', type=float, default=0.)
     parser.add_argument('--target_kl', type=float, default=0.012)
     parser.add_argument('--max_episode_steps', type=int, default=1000)
+    parser.add_argument('--stop_extra_early', default=False, action='store_true')
     parser.add_argument('--save_interval', type=int)
     parser.add_argument('--seed', type=int)
     parser.add_argument('--run_dir')
@@ -387,12 +394,13 @@ def main():
                            cost_max=args.cost_max, risk_type=args.risk_type, risk_init_coef=args.risk_init_coef,
                            risk_end_coef=args.risk_end_coef, risk_warmup_steps=args.risk_warmup_steps,
                            risk_grow_steps=args.risk_grow_steps, risk_temperature=args.risk_temperature,
-                           risk_margin=args.risk_margin)
+                           risk_margin=args.risk_margin, risk_max_value=args.risk_max_value)
     hp = CPPOHyperparameters(num_train_iters=args.num_train_iters, steps_per_iter=args.steps_per_iter,
                              save_interval=args.save_interval, run_dir=args.run_dir, cost_threshold=args.cost_threshold,
                              batch_size=args.batch_size, num_actor_epochs=args.num_actor_epochs,
                              num_critic_epochs=args.num_critic_epochs, clip_epsilon=args.clip_epsilon,
-                             entropy_coef=args.entropy_coef, kl_coef=args.kl_coef, target_kl=args.target_kl)
+                             entropy_coef=args.entropy_coef, kl_coef=args.kl_coef, target_kl=args.target_kl,
+                             stop_extra_early=args.stop_extra_early)
 
     cppo = CPPO(env=env, actor=actor, critic=critic, actor_optimizer=actor_optimizer, hp=hp)
     print(cppo)

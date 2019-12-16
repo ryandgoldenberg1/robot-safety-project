@@ -242,6 +242,12 @@ class GaussianPolicy:
         mean, variance = self.net(obs)
         assert mean.shape == (bs, *self.action_shape)
         assert variance.shape == (bs, *self.action_shape)
+        if torch.isnan(variance).sum() > 0:
+            print('nan var:', variance)
+            print('obs:', obs)
+            print('params:')
+            for param in self.net.parameters():
+                print(param)
         return mean, variance
 
     def _validate_distribution_params(self, distribution_params):
@@ -263,6 +269,7 @@ class GaussianPolicy:
             print('singular covariance matrix detected')
             print('dets:', dets)
             print('covariance:', covariance)
+            print('variance:', variance)
         distribution = MultivariateNormal(loc=mean, covariance_matrix=covariance)
         return distribution
 
